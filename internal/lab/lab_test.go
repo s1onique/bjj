@@ -81,3 +81,31 @@ func TestSetupCreatesDisposableLab(t *testing.T) {
 		t.Fatalf("git client missing: %v", err)
 	}
 }
+
+// TestSeedConflictedCommit_MaterialisesConflict verifies that
+// SeedConflictedCommit produces a commit whose `conflict` flag
+// is true (per jj 0.41.0's commit-level conflict detection,
+// exposed through `conflict` in `jj log -T`).
+func TestSeedConflictedCommit_MaterialisesConflict(t *testing.T) {
+	RequireGitAndJJ(t)
+	ctx := context.Background()
+	l, err := Setup(ctx)
+	if err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	defer l.Cleanup()
+
+	_, _, err = l.SeedConflictedCommit(ctx)
+	if err != nil {
+		t.Fatalf("SeedConflictedCommit: %v", err)
+	}
+	out, err := l.JJOutput(ctx, l.JJClient, []string{
+		"log", "--no-graph", "-r", "@", "-T", "conflict",
+	})
+	if err != nil {
+		t.Fatalf("jj log: %v", err)
+	}
+	if !strings.Contains(out, "true") {
+		t.Fatalf("expected conflict=true on @; got %q", out)
+	}
+}

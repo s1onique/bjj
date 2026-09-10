@@ -322,3 +322,153 @@ func (l *Lab) SeedConflictedBookmark(ctx context.Context, bookmark string) error
 	}
 	return l.runJJ(ctx, l.JJClient, []string{"git", "fetch", "--remote", "lab"})
 }
+
+// SeedConflictedCommit creates an outgoing commit whose contents
+// are in an unresolved content conflict at the time of the call.
+//
+// It does this by:
+//
+//  1. creating two parallel changes ("side a" and "side b")
+//     from the same base, each touching the SAME file with
+//     different content;
+//  2. merging them at @ with `jj new '<side-a-change-id> | <side-b-change-id>'`.
+//     jj records the conflict markers in the working copy.
+//
+// The conflicted working-copy change is left at @; the bookmark
+// is NOT moved. Callers that want to publish this commit must
+// move a bookmark to the conflicted change themselves.
+//
+// ACT-BJJ-ADMISSION01 §31 requires a deterministic conflicted-
+// commit fixture different from the conflicted-bookmark fixture
+// produced by SeedConflictedBookmark.
+//
+// The function uses the `main` bookmark as the base when
+// available (the standard lab fixture creates it). When `main`
+// is not present, the function falls back to the unique non-
+// root commit currently in the repo.
+func (l *Lab) SeedConflictedCommit(ctx context.Context) (changeID, commitID string, err error) {
+	if l == nil || l.JJClient == "" {
+		return "", "", errors.New("lab: SeedConflictedCommit: lab not set up")
+	}
+
+	// Resolve base: prefer `main`, else the single non-root
+	// commit currently in the repo.
+	baseRevset := "main"
+	if out, jerr := l.jjOutput(ctx, l.JJClient, []string{
+		"log", "--no-graph", "-r", "main", "--limit", "1", "-T", "commit_id",
+	}); jerr != nil || strings.TrimSpace(out) == "" {
+		// Fallback: the only non-root commit (the lab's seed
+		// commit).
+		baseRevset = "all() & ~root()"
+	}
+
+	if err := l.runJJ(ctx, l.JJClient, []string{"new", baseRevset, "-m", "side a"}); err != nil {
+		return "", "", err
+	}
+	if err := os.WriteFile(filepath.Join(l.JJClient, "shared.txt"), []byte("side-a content\n"), 0o644); err != nil {
+		return "", "", err
+	}
+	sideA, err := l.jjOutput(ctx, l.JJClient, []string{"log", "--no-graph", "-r", "@", "-T", "change_id"})
+	if err != nil {
+		return "", "", err
+	}
+	sideA = strings.TrimSpace(sideA)
+
+	if err := l.runJJ(ctx, l.JJClient, []string{"new", baseRevset, "-m", "side b"}); err != nil {
+		return "", "", err
+	}
+	if err := os.WriteFile(filepath.Join(l.JJClient, "shared.txt"), []byte("side-b content\n"), 0o644); err != nil {
+		return "", "", err
+	}
+	sideB, err := l.jjOutput(ctx, l.JJClient, []string{"log", "--no-graph", "-r", "@", "-T", "change_id"})
+	if err != nil {
+		return "", "", err
+	}
+	sideB = strings.TrimSpace(sideB)
+
+	mergeRevset := sideA + " | " + sideB
+	if err := l.runJJ(ctx, l.JJClient, []string{"new", mergeRevset, "-m", "merge"}); err != nil {
+		return "", "", err
+	}
+	body, err := os.ReadFile(filepath.Join(l.JJClient, "shared.txt"))
+	if err != nil {
+		return "", "", err
+	}
+	if !strings.Contains(string(body), "<<<<<<<") {
+		return "", "", fmt.Errorf("lab: SeedConflictedCommit: expected conflict markers in shared.txt; got %q", string(body))
+	}
+	cid, err := l.jjOutput(ctx, l.JJClient, []string{"log", "--no-graph", "-r", "@", "-T", "commit_id"})
+	if err != nil {
+		return "", "", err
+	}
+	commitID = strings.TrimSpace(cid)
+	chid, err := l.jjOutput(ctx, l.JJClient, []string{"log", "--no-graph", "-r", "@", "-T", "change_id"})
+	if err != nil {
+		return "", "", err
+	}
+	changeID = strings.TrimSpace(chid)
+	return changeID, commitID, nil
+}
+
+// SeedPolicyInCandidate writes body to ".bjj/policy.toml" in
+// the jj client workspace and then commits it into the current
+// @ change so it becomes part of the candidate tree.
+//
+// CORRECTION03 §5: production admission reads the policy from
+// the frozen candidate via `jj file show -r <NEW> --at-op=<OP>`,
+// so the policy MUST be part of the NEW commit's tree, not just
+// left in the live working copy. Tests that previously called
+// `os.WriteFile` directly into the working tree must now route
+// through this helper to remain CORRECTION03-compliant.
+//
+// Use:
+//
+//	body := "schema_version = 1\nprivate_commits = \"description('private:*')\"\n"
+//	if err := l.SeedPolicyInCandidate(ctx, body); err != nil { ... }
+//
+// The function returns an error and aborts if body is empty
+// (writing an empty file would be a meaningless test fixture).
+func (l *Lab) SeedPolicyInCandidate(ctx context.Context, body string) error {
+	if l == nil || l.JJClient == "" {
+		return errors.New("lab: SeedPolicyInCandidate: lab not set up")
+	}
+	if body == "" {
+		return errors.New("lab: SeedPolicyInCandidate: empty policy body")
+	}
+	if err := os.MkdirAll(filepath.Join(l.JJClient, ".bjj"), 0o755); err != nil {
+		return fmt.Errorf("lab: SeedPolicyInCandidate: mkdir: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(l.JJClient, ".bjj", "policy.toml"), []byte(body), 0o644); err != nil {
+		return fmt.Errorf("lab: SeedPolicyInCandidate: write: %w", err)
+	}
+	if err := l.runJJ(ctx, l.JJClient, []string{"describe", "-m", "bjj: candidate policy"}); err != nil {
+		return fmt.Errorf("lab: SeedPolicyInCandidate: describe: %w", err)
+	}
+	return nil
+}
+
+// SeedPolicyInOp does the same as SeedPolicyInCandidate but
+// also writes the file to a brand-new empty change. Useful when
+// a test needs the policy to live on a separate change from the
+// subject commits.
+func (l *Lab) SeedPolicyInOp(ctx context.Context, body, description string) error {
+	if l == nil || l.JJClient == "" {
+		return errors.New("lab: SeedPolicyInOp: lab not set up")
+	}
+	if body == "" {
+		return errors.New("lab: SeedPolicyInOp: empty policy body")
+	}
+	if err := l.runJJ(ctx, l.JJClient, []string{"new", "-m", description}); err != nil {
+		return fmt.Errorf("lab: SeedPolicyInOp: new: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Join(l.JJClient, ".bjj"), 0o755); err != nil {
+		return fmt.Errorf("lab: SeedPolicyInOp: mkdir: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(l.JJClient, ".bjj", "policy.toml"), []byte(body), 0o644); err != nil {
+		return fmt.Errorf("lab: SeedPolicyInOp: write: %w", err)
+	}
+	if err := l.runJJ(ctx, l.JJClient, []string{"describe", "-m", description}); err != nil {
+		return fmt.Errorf("lab: SeedPolicyInOp: describe: %w", err)
+	}
+	return nil
+}

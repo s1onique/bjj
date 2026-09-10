@@ -76,8 +76,60 @@ or human-only formats where machine parsability is expected.
 
 ## Publication boundary
 
-The BJJ publication boundary is **not yet implemented**. Do not
-attempt to push this repository automatically. The user will decide
-the publication step separately because the very mechanism by which
-this repository should eventually publish is what the project is
-constructing.
+The BJJ publication boundary is **partially implemented**:
+
+- `internal/plan` (`bjj plan`) — ACT-BJJ-PLAN01 closed: freezes
+  the canonical publication subject.
+- `internal/admission` (`bjj admit`) — ACT-BJJ-ADMISSION01
+  closed: evaluates the frozen subject against an explicit
+  policy and emits a typed decision (`admit` | `deny` |
+  `not_needed`).
+- `internal/verify`, `internal/publish`, `internal/receipt` —
+  **not yet implemented**.
+
+Do not attempt to push this repository automatically. The user
+will decide the publication step separately because the very
+mechanism by which this repository should eventually publish is
+what the project is constructing.
+
+The `bjj admit` command is read-only: it never invokes
+`git push`, `git fetch`, `jj git push`, or `jj git fetch`. The
+`internal/admission` layer has no direct import of
+`internal/plan` (the dependency is mediated by the `PlanView`
+adapter) and the evaluator (`evaluate.go`) imports no I/O
+package. Any future change that violates these invariants MUST
+be caught by the AST guard in `internal/plan/safety_test.go`.
+
+The bounded `.bjj/policy.toml` parser is fail-closed in three
+directions and these invariants are enforced by tests:
+
+- unknown keys → `POLICY_INVALID` (CORRECTION01 §4);
+- duplicate keys → `POLICY_INVALID` (CORRECTION02 §1);
+- present file without an explicit `schema_version = 1` →
+  `POLICY_INVALID` (CORRECTION02 §2).
+
+Absent files still resolve to the built-in default; the
+schema_version requirement applies only to present files.
+
+The policy load is bound to the SAME frozen Jujutsu operation
+view that produced the PublishPlan. The production CLI
+(`cmd/bjj/admit.go`) MUST NOT call
+`admission.LoadPolicyFromRepo(dir)`; it MUST go through
+`admission.LoadPolicyAt(ctx, reader, planView, dir, opID)`,
+which reads the file via
+`jj --at-op=<OP_A> file show -r <NEW> <path>`. The legacy
+live-fs reader is retained only for parser unit tests, and
+the static guard `TestCmdAdmissionPathUsesPolicyReader` in
+`internal/plan/safety_test.go` AST-rejects any production
+caller that tries to use it.
+
+Documentation durability is enforced by `TestDocs_*` in
+`internal/admission/docs_test.go`, which fail if any of the
+known CORRECTION01/CORRECTION02/CORRECTION03 fossil phrases
+reappear in `docs/architecture.md` or
+`docs/acts/ACT-BJJ-ADMISSION01.md` ("Unknown top-level keys
+are ignored for forward-compatibility", "outgoing set ::NEW ~
+root()", "internal/plan provides a WrapPlan() adapter
+implementation", `subject | policy.PrivateCommits` inside a
+code-fenced block, "stricter than TOML itself" applied to
+duplicate keys).

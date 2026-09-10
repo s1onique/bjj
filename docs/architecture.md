@@ -4,9 +4,10 @@ BJJ is designed around a small number of explicit trust zones and a
 transaction pipeline that crosses from one zone to another.
 
 > The architecture document records **intended** structure. Only the
-> parts marked **Implemented in ACT-BJJ-LAB01** or **Implemented in
-> ACT-BJJ-PLAN01** have been built. Everything after PLAN01 is
-> **future architecture**.
+> parts marked **Implemented in ACT-BJJ-LAB01**,
+> **Implemented in ACT-BJJ-PLAN01**, or **Implemented in
+> ACT-BJJ-ADMISSION01** have been built. Everything after
+> ADMISSION01 is **future architecture**.
 
 ## Trust zones
 
@@ -42,11 +43,11 @@ The publication transaction is a finite state machine. Each step
 narrows the set of acceptable next steps.
 
 ```text
-RESOLVE
+RESOLVE            [implemented in ACT-BJJ-PLAN01]
   ↓
-PLAN_FROZEN
+PLAN_FROZEN        [implemented in ACT-BJJ-PLAN01]
   ↓
-ADMITTED
+ADMITTED           [implemented in ACT-BJJ-ADMISSION01]
   ↓
 CHECKED
   ↓
@@ -63,7 +64,7 @@ REMOTE_VERIFIED
 RECEIPT
 ```
 
-Status meanings (future):
+Status meanings:
 
 | Status              | Meaning                                                   |
 |---------------------|-----------------------------------------------------------|
@@ -144,6 +145,291 @@ demonstrate the exact authority leak later ACTs must remove.
 
 These belong to subsequent ACTs. Each will be designed using what
 ACT-LAB01 demonstrates about the real Jujutsu control surface.
+
+## Implemented in ACT-BJJ-ADMISSION01
+
+ADMISSION01 closes the **PLAN_FROZEN → ADMITTED** transition.
+PLAN01 freezes the publication subject; ADMISSION01 evaluates
+that subject against an explicit policy and emits a typed
+decision (`admit` | `deny` | `not_needed`) before any expensive
+verification runs.
+
+### Implemented in ACT-BJJ-ADMISSION01-CORRECTION01
+
+Three properties the original closure only claimed are now
+implemented and tested:
+
+1. **Subject-set exactness.** The fact gatherer reads
+   `PublishPlan.Commits` verbatim from
+   `planView.OutgoingCommits()` and restricts every predicate
+   query to that exact set. Already-published ancestors can no
+   longer widen admission.
+
+2. **Fail-closed policy schema.** Unknown keys in
+   `.bjj/policy.toml` produce a hard `POLICY_INVALID` error
+   instead of being silently ignored. `schema_version` is the
+   deliberate forward-compatibility boundary.
+
+3. **Real package decoupling.** The concrete
+   `*plan.PublishPlan -> admission.PlanView` adapter lives in
+   `cmd/bjj/plan_adapter.go`. `internal/admission` does not
+   import `internal/plan`; the boundary is enforced by
+   `TestAdmissionHasNoDirectPlanImport`.
+
+### Implemented in ACT-BJJ-ADMISSION01-CORRECTION02
+
+Three remaining P1 defects closed after the CORRECTION01 review.
+No architecture changes; this is a policy-parser hardening and a
+documentation-truth pass.
+
+1. **Duplicate policy keys fail closed.** `parsePolicyTOML`
+   tracks every key in a `saw` map and returns
+   `POLICY_INVALID` ("duplicate policy key %q") the second
+   time the same key appears, regardless of whether the key is
+   recognised or unknown. The bounded parser preserves the
+   fail-closed duplicate-key rule that the TOML spec already
+   mandates ("Defining a key multiple times is invalid"), so a
+   generated/merged policy file cannot quietly weaken a rule
+   by repeating the same key with a different value
+   (e.g. `private_commits = "X"` followed by
+   `private_commits = "none()"`).
+
+2. **schema_version is required.** A present policy file MUST
+   declare exactly one `schema_version = 1` line. The parser
+   tracks `schemaSeen` and fails closed otherwise. The
+   absent-file case still resolves to `DefaultPolicy()` with
+   `PolicyOutcomeDefault`. The `schema_version` line is now an
+   explicit schema boundary that future migrations can rely on.
+
+3. **Documentation truth.** The post-CORRECTION01 review found
+   three stale prose passages in the durable documents
+   (malformed-policy description still saying "Unknown keys are
+   ignored for forward-compatibility", the fact-gathering
+   contract listing `subject | policy.PrivateCommits` (union)
+   instead of the actual intersection, and the architecture
+   section still describing a four-query gatherer with
+   `::NEW ~ root()`). All replaced; the replacement text is
+   enforced by `TestDocs_*` regression tests in
+   `internal/admission/docs_test.go`.
+
+### Implemented in ACT-BJJ-ADMISSION01-CORRECTION03
+
+The post-CORRECTION02 review identified one P0 defect capable
+of false admission or denial. `.bjj/policy.toml` was read
+from the live working-tree filesystem via `os.ReadFile(<dir>/...)`
+AFTER `plan.ResolveObserved` had pinned the operation view.
+PLAN01 and admission facts were pinned to `OP_A`, but the
+policy load ran against the live filesystem, which could be a
+different operation view by the time it executed. CORRECTION03
+binds the policy read to the same frozen Jujutsu view that
+produced the PublishPlan.
+
+What changed:
+
+1. **Policy view binding (P0).** `.bjj/policy.toml` is now read
+   via `jj --at-op=<OP_A> file show -r <NEW> .bjj/policy.toml`
+   in `cmd/bjj/admit.go`. `internal/jjadapter.Adapter` gains
+   `FileShowAtOp(ctx, dir, opID, revision, path) ([]byte,
+   FilePresence, error)` with a typed PRESENT/ABSENT
+   discriminator and explicit input validation (empty opID,
+   revision, or path are rejected with `ErrJJFailed`).
+2. **Candidate-local policy (P0 follow-on).** Policy bytes
+   are read from `PublishPlan.BookmarkMoves[0].New.CommitID`
+   as visible at `obs.SourceOperationID`. `internal/admission`
+   gains a `PolicyReader` interface and a new entry point
+   `LoadPolicyAt(ctx, reader, planView, dir, opID)` that the
+   production CLI uses. The legacy `LoadPolicyFromRepo(dir)`
+   helper is retained only for parser unit tests.
+3. **DefaultPolicy semantics on absence (P0 follow-on).**
+   `DefaultPolicy()` now applies only when the file is
+   genuinely absent from the candidate tree at the pinned
+   view. A working-copy mutation between plan resolution and
+   policy load cannot change that outcome.
+4. **Static guard (P0 follow-on).**
+   `TestCmdAdmissionPathUsesPolicyReader` in
+   `internal/plan/safety_test.go` walks `cmd/bjj/*.go`
+   (non-test) and AST-rejects any caller that invokes
+   `admission.LoadPolicyFromRepo`. The production admission
+   decision path cannot regress to live-fs reads without this
+   test failing.
+5. **Documentation fossil (P2).** The durable prose repeatedly
+   described the bounded parser as more restrictive than
+   TOML itself with respect to duplicate keys. TOML already
+   mandates that "Defining a key multiple times is invalid"
+   (v1.1.0 spec). Corrected to "preserves the fail-closed
+   duplicate-key rule that the TOML spec already mandates".
+
+Invariants the P0 closure establishes:
+
+```text
+ADMISSION_PLAN_VIEW   == OP_A
+ADMISSION_FACT_VIEW   == OP_A
+ADMISSION_POLICY_VIEW == OP_A
+```
+
+i.e. the canonical publication subject, the candidate policy
+bytes, and the admission facts all come from the same frozen
+Jujutsu operation view. CHECK01 can now build on a single
+admission decision.
+
+`policy provenance != policy authority`: this closure binds
+the provenance of repository-local policy bytes but does NOT
+make that policy authoritative. Authoritative policy remains
+deferred to a later ACT.
+
+### New packages
+
+- `internal/admission` — pure evaluator + typed fact gatherer:
+  - `AdmissionInput`, `AdmissionFacts`, `AdmissionResult`,
+    `SubjectIdentity`, `Reason`, `Policy`;
+  - `MoveRelation` (`CREATE` | `FAST_FORWARD` |
+    `NON_FAST_FORWARD` | `NO_CHANGE`);
+  - `Decision` (`admit` | `deny` | `not_needed`);
+  - typed `ReasonCode` (`NO_REMOTE_CHANGE` | `NON_FAST_FORWARD` |
+    `NEW_BOOKMARK_NOT_ALLOWED` | `PRIVATE_COMMIT` |
+    `CONFLICTED_COMMIT` | `EMPTY_DESCRIPTION` |
+    `FACTS_INCONSISTENT`) in canonical total order;
+  - typed `ErrorCode` (`JJ_QUERY_FAILED` | `JJ_PARSE_FAILED` |
+    `POLICY_INVALID` | `INCONSISTENT_REPOSITORY_VIEW` |
+    `NO_BOOKMARK_MOVE`);
+  - `Policy` with `DefaultPolicy()` and `LoadPolicyFromRepo()`
+    reading `.bjj/policy.toml` (failed-closed on malformed
+    input; never silently falls back to defaults);
+  - `PlanView` adapter — slim interface so the evaluator is
+    decoupled from `internal/plan`. The concrete
+    `*plan.PublishPlan -> admission.PlanView` bridge lives in
+    `cmd/bjj/plan_adapter.go`; `internal/admission` does not
+    import `internal/plan`.
+- `internal/jjadapter` extensions:
+  - new `CommitObs` template and `ListCommitObs` method
+    (carrying `commit_id`, `change_id`, `conflict`, and
+    `description.first_line()`);
+  - `ParseCommitObsLines` fail-closed on any malformed row.
+- `internal/lab` extensions:
+  - `SeedConflictedCommit` fixture for `CONFLICTED_COMMIT`
+    evidence tests.
+
+### Process model
+
+ADMISSION01 is read-only:
+
+- no `git push`, `git fetch`, `jj git push`, `jj git fetch`;
+- no `jj new`, `jj describe`, `jj bookmark set`, `jj squash`;
+  these mutate the working-copy view and would invalidate the
+  pinned operation id;
+- no transport, no remote contact;
+- no policy update; policy is loaded once and frozen per run.
+
+### Fact-gathering contract
+
+The `Gatherer` is the only place that talks to the adapter. It
+issues at most three bounded `jj` queries, all pinned to
+`--at-op=<OpID>`:
+
+```text
+1. ancestry probe      (OLD & ::NEW)              (classifyMove)
+2. private predicate   (subject & policy.PrivateCommits)
+3. per-commit obs      (subject)                  (ListCommitObs)
+```
+
+The canonical subject is taken VERBATIM from
+`PublishPlan.Commits` via `planView.OutgoingCommits()`; the
+gatherer never issues a fourth `::NEW ~ root()` query to
+reconstruct the outgoing set. `subject & policy.PrivateCommits`
+is an INTERSECTION, so an already-published private ancestor
+that matches the policy expression does NOT participate in
+admission.
+
+The `OpID` is captured from the source `PlanObservation` and
+threaded through to every query. Mid-gather mutation cannot mix
+views because the production `Source` refuses to re-pin (an
+empty `OpID` yields `INCONSISTENT_REPOSITORY_VIEW`).
+
+```text
+ADMISSION_FACTS_SAME_VIEW = PASS
+ADMISSION_MID_GATHER_MUTATION_CANNOT_MIX_VIEWS = PASS
+```
+
+### Static safeguards
+
+The `TestPlanLayerHasNoTransport` AST guard is extended to walk
+`internal/admission` and reject any `[]string` literal
+containing `git push`, `git fetch`, `jj git push`, or
+`jj git fetch`. The `internal/admission` package has NO direct
+import of `internal/plan`; the dependency goes through the
+`PlanView` adapter. The `evaluate.go` file has NO imports of
+`os`, `net`, `path/filepath`, or any I/O package.
+
+### New CLI surface
+
+- `bjj admit --remote <R> --bookmark <B>`
+- `bjj admit --remote <R> --bookmark <B> --json`
+- `bjj help` now lists `admit`.
+
+### CLI exit codes
+
+| Code | Meaning                                                   |
+|------|-----------------------------------------------------------|
+| 0    | admitted                                                  |
+| 1    | invalid CLI arguments                                     |
+| 2    | internal / infrastructure failure (typed `*Error`)        |
+| 3    | valid decision but denied or not_needed                   |
+
+### Default policy
+
+When `.bjj/policy.toml` is absent, `DefaultPolicy()` is used:
+
+```text
+allow_new_bookmarks      = true
+allow_non_fast_forward   = false
+require_description      = true
+allow_conflicted_commits = false
+private_commits          = "none()"
+```
+
+### Properties
+
+| Property                                                | Status |
+|---------------------------------------------------------|--------|
+| BJJ_ADMIT_COMMAND_IMPLEMENTED                           | PASS   |
+| BJJ_ADMIT_DECISION_TYPED                                | PASS   |
+| BJJ_ADMIT_EXIT_CODE_CONTRACT                            | PASS   |
+| BJJ_ADMIT_JSON_STRICT                                   | PASS   |
+| BJJ_ADMIT_DETERMINISTIC                                 | PASS   |
+| BJJ_ADMIT_FACTS_SAME_VIEW                               | PASS   |
+| BJJ_ADMIT_MID_GATHER_MUTATION_CANNOT_MIX_VIEWS          | PASS   |
+| BJJ_ADMIT_DEFAULT_POLICY                                | PASS   |
+| BJJ_ADMIT_MALFORMED_POLICY_FAILS_CLOSED                 | PASS   |
+| BJJ_ADMIT_FACT_QUERY_FAIL_FAILS_CLOSED                  | PASS   |
+| BJJ_ADMIT_FF                                            | PASS   |
+| BJJ_ADMIT_NFF_DENY_DEFAULT                              | PASS   |
+| BJJ_ADMIT_NFF_ALLOWED_BY_POLICY                         | PASS   |
+| BJJ_ADMIT_PRIVATE_COMMIT                                | PASS   |
+| BJJ_ADMIT_PRIVATE_ANCESTOR                              | PASS   |
+| BJJ_ADMIT_CONFLICTED_COMMIT                             | PASS   |
+| BJJ_ADMIT_EMPTY_DESCRIPTION                             | PASS   |
+| BJJ_ADMIT_NO_REMOTE_CHANGE                              | PASS   |
+| ADMISSION_LAYER_HAS_NO_TRANSPORT                        | PASS   |
+| ADMISSION_NO_DIRECT_PLAN_IMPORT                         | PASS   |
+
+CORRECTION02 properties:
+
+| Property                                                | Status       |
+|---------------------------------------------------------|--------------|
+| POLICY_DUPLICATE_KEY_FAILS_CLOSED                       | FAIL_CLOSED  |
+| POLICY_DUPLICATE_CANNOT_WEAKEN_POLICY                   | PASS         |
+| POLICY_DUPLICATE_SCHEMA_VERSION                         | FAIL_CLOSED  |
+| POLICY_SCHEMA_MISSING                                   | FAIL_CLOSED  |
+| POLICY_SCHEMA_DUPLICATE                                 | FAIL_CLOSED  |
+| POLICY_SCHEMA_UNSUPPORTED                               | FAIL_CLOSED  |
+| POLICY_ABSENT_FILE_STILL_DEFAULT                        | PASS         |
+| DOC_ADMISSION_UNKNOWN_KEYS_MATCH_CODE                   | PASS         |
+| DOC_ADMISSION_QUERY_CONTRACT_MATCHES_CODE               | PASS         |
+| DOC_ADMISSION_PLAN_BRIDGE_MATCHES_CODE                  | PASS         |
+| DOC_ADMISSION_PRIVATE_PREDICATE_MATCHES_CODE            | PASS         |
+
+See `docs/acts/ACT-BJJ-ADMISSION01.md` for the full acceptance
+matrix and CLI samples.
 
 ## Implemented in ACT-BJJ-PLAN01
 

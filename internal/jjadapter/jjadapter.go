@@ -48,6 +48,22 @@ const BookmarksTemplate = `name ++ "|" ++ remote ++ "|" ++ present ++ "|" ++ con
 // No graph characters. No colors. Full identifiers only.
 const LogTemplate = `commit_id ++ "|" ++ change_id ++ "\n"`
 
+// CommitObsTemplate emits one commit per line as
+// "<commit_id>|<change_id>|<conflict>|<first_line_of_description>".
+//
+// Fields:
+//
+//	commit_id  - full hex Git-compatible commit id
+//	change_id  - full hex Jujutsu change id
+//	conflict   - "true" | "false", true if the commit has unresolved
+//	             content conflicts in the pinned view
+//	first_line - the commit's first description line, with no trailing
+//	             newline. Empty string when the description is empty.
+//
+// Used by internal/admission to gather per-commit predicates
+// (conflict + description) in one query.
+const CommitObsTemplate = `commit_id ++ "|" ++ change_id ++ "|" ++ conflict ++ "|" ++ description.first_line() ++ "\n"`
+
 // OperationIDTemplate emits the bare operation id followed by a
 // newline.
 const OperationIDTemplate = `id ++ "\n"`
@@ -57,6 +73,27 @@ const OperationIDTemplate = `id ++ "\n"`
 type CommitRef struct {
 	CommitID string
 	ChangeID string
+}
+
+// CommitObs is the typed observation of a single commit used by
+// internal/admission. It carries the same identifiers as
+// CommitRef plus two predicates required by admission:
+//
+//	Conflict  - true iff the commit has unresolved content conflicts
+//	            in the pinned view
+//	FirstLine - the commit's first description line (empty when
+//	            the description itself is empty)
+//
+// Empty descriptions are detected via FirstLine == "" per
+// ACT-BJJ-ADMISSION01 §12. We deliberately use the description's
+// first line (not the full description) so the output stays
+// bounded and parse-friendly. The ACT's empty-description rule
+// rejects any commit whose first line is empty, which matches
+// what `jj git push` itself rejects.
+type CommitObs struct {
+	CommitRef
+	Conflict  bool
+	FirstLine string
 }
 
 // BookmarkRef is a single bookmark row parsed from
@@ -292,6 +329,40 @@ func (a *Adapter) ListCommits(ctx context.Context, dir, opID, revset string) ([]
 	return parseCommitLines(res.program, argv, res.Stdout)
 }
 
+// ListCommitObs returns the commits selected by revset, full
+// identifiers plus per-commit predicates (conflict, first-line
+// description), in jj's default order.
+//
+// This is the single bounded query admission uses to gather the
+// per-commit predicates required by §11 (conflicted commit) and
+// §12 (empty description). The output is parsed strictly; any
+// non-conforming line yields *ErrJJParseFailed.
+func (a *Adapter) ListCommitObs(ctx context.Context, dir, opID, revset string) ([]CommitObs, error) {
+	argv := []string{
+		"log", "--no-graph",
+		"-T", CommitObsTemplate,
+		"--ignore-working-copy",
+		"--no-integrate-operation",
+	}
+	if opID != "" {
+		argv = append(argv, "--at-op="+opID)
+	}
+	if revset != "" {
+		argv = append(argv, "-r", revset)
+	}
+	res := a.run(ctx, dir, argv)
+	if res.Err != nil {
+		return nil, &ErrJJFailed{
+			Program:  res.program,
+			Argv:     argv,
+			ExitCode: res.ExitCode,
+			Stderr:   string(res.Stderr),
+			Cause:    res.Err,
+		}
+	}
+	return parseCommitObsLines(res.program, argv, res.Stdout)
+}
+
 // ListRemotes returns the set of remote names and URLs known to the
 // repository. `jj git remote list` does not accept -T and emits
 // "<remote> <url>" per line; we parse that stable shape.
@@ -332,6 +403,140 @@ func (a *Adapter) ListRemotes(ctx context.Context, dir, opID string) (map[string
 		out[name] = url
 	}
 	return out, nil
+}
+
+// FilePresence classifies the result of a file observation.
+//
+// This is a typed discriminator so callers can distinguish a clean
+// "the file does not exist in that revision" outcome from a real
+// infrastructure failure (corrupt repo, jj process error, parser
+// anomaly). Per ACT-BJJ-ADMISSION01-CORRECTION03 §2 the absence
+// of a policy file in the frozen candidate tree resolves to
+// DefaultPolicy; an infrastructure failure, on the other hand,
+// MUST surface as a typed error.
+type FilePresence string
+
+const (
+	// FilePresencePresent means the file exists and the bytes are
+	// returned.
+	FilePresencePresent FilePresence = "PRESENT"
+
+	// FilePresenceAbsent means the file does not exist in the
+	// revision at the pinned operation view. NOT an error.
+	FilePresenceAbsent FilePresence = "ABSENT"
+)
+
+// FileShowAtOp reads the contents of path from revision as visible
+// at the pinned operation view.
+//
+// Conceptually:
+//
+//	jj --at-op=<opID> file show -r <revision> <path>
+//
+// This is the only safe way for ACT-BJJ-ADMISSION01-CORRECTION03
+// to read the candidate policy: it pins BOTH the operation view
+// AND the revision, so a live-working-copy mutation between the
+// time the plan was resolved and the time the policy was loaded
+// cannot influence admission.
+//
+// Behaviour:
+//
+//   - revision MUST be non-empty (otherwise the call would read
+//     from the live workspace, which is exactly the bug this
+//     method exists to prevent); empty -> ErrJJFailed.
+//   - path MUST be non-empty (otherwise `jj file show` would
+//     misbehave); empty -> ErrJJFailed.
+//   - opID MUST be non-empty for the same reason; empty ->
+//     ErrJJFailed. ("@", "current workspace", and "current
+//     operation" are FORBIDDEN here.)
+//   - file present in revision -> FilePresencePresent + bytes.
+//   - file absent from revision -> FilePresenceAbsent + nil bytes
+//   - nil error.
+//   - jj invocation failed for any other reason -> FilePresence
+//     unspecified + *ErrJJFailed.
+//
+// The adapter performs no mutation and no fetch; the command is
+// pure read against the cached operation log.
+func (a *Adapter) FileShowAtOp(ctx context.Context, dir, opID, revision, path string) ([]byte, FilePresence, error) {
+	if opID == "" {
+		return nil, "", &ErrJJFailed{
+			Program: "jj",
+			Argv:    []string{"file", "show", "-r", revision, path},
+			// No process was started; surface as -1 so callers do
+			// not mistake this for a real exit code.
+			ExitCode: -1,
+			Stderr:   "jjadapter.FileShowAtOp: opID is empty; refusing to read from the live operation",
+		}
+	}
+	if revision == "" {
+		return nil, "", &ErrJJFailed{
+			Program:  "jj",
+			Argv:     []string{"--at-op=" + opID, "file", "show", path},
+			ExitCode: -1,
+			Stderr:   "jjadapter.FileShowAtOp: revision is empty; refusing to read from the live workspace",
+		}
+	}
+	if path == "" {
+		return nil, "", &ErrJJFailed{
+			Program:  "jj",
+			Argv:     []string{"--at-op=" + opID, "file", "show", "-r", revision},
+			ExitCode: -1,
+			Stderr:   "jjadapter.FileShowAtOp: path is empty",
+		}
+	}
+
+	argv := []string{
+		"file", "show",
+		"-r", revision,
+		"--ignore-working-copy",
+		"--no-integrate-operation",
+		"--at-op=" + opID,
+		path,
+	}
+	res := a.run(ctx, dir, argv)
+	// execx.Run populates res.Err whenever the child exits with a
+	// non-zero status (see internal/execx/execx.go). For
+	// `jj file show` a non-zero exit with "No such path" on stderr
+	// is the ABSENT case and MUST be classified as such before we
+	// treat the result as a real invocation failure. We therefore
+	// check the exit code + stderr first, and only then promote a
+	// remaining error to *ErrJJFailed.
+	if res.ExitCode != 0 {
+		stderr := string(res.Stderr)
+		if isAbsentFileShowStderr(stderr) {
+			return nil, FilePresenceAbsent, nil
+		}
+		return nil, "", &ErrJJFailed{
+			Program:  res.program,
+			Argv:     argv,
+			ExitCode: res.ExitCode,
+			Stderr:   stderr,
+			Cause:    res.Err,
+		}
+	}
+	if res.Err != nil {
+		// res.Err set but ExitCode == 0: an infrastructure-level
+		// failure (program not found, I/O error). Surface it.
+		return nil, "", &ErrJJFailed{
+			Program:  res.program,
+			Argv:     argv,
+			ExitCode: res.ExitCode,
+			Stderr:   string(res.Stderr),
+			Cause:    res.Err,
+		}
+	}
+	return res.Stdout, FilePresencePresent, nil
+}
+
+// isAbsentFileShowStderr matches the stable "file does not exist"
+// message `jj file show` emits on jj 0.41.0. We deliberately key
+// on a substring ("No such path") so the check remains robust to
+// small wording changes in future jj releases while still
+// distinguishing the absence case from real invocation failures
+// (which carry entirely different exit codes and stderr
+// signatures).
+func isAbsentFileShowStderr(s string) bool {
+	return strings.Contains(s, "No such path")
 }
 
 // run executes jj under the adapter's environment policy and
@@ -564,6 +769,71 @@ func parseCommitLines(prog string, argv []string, b []byte) ([]CommitRef, error)
 		out = append(out, CommitRef{
 			CommitID: commitID,
 			ChangeID: changeID,
+		})
+	}
+	return out, nil
+}
+
+// parseCommitObsLines parses the bounded stdout of `jj log` under
+// CommitObsTemplate into typed CommitObs rows.
+//
+// Per ACT-BJJ-PLAN01-CORRECTION02 §3 (extended for ADMISSION01),
+// the parser fails closed: any non-empty line whose shape does
+// not match
+//
+//	"<commit_id>|<change_id>|<true|false>|<first_line>"
+//
+// yields *ErrJJParseFailed. The parser NEVER silently drops a
+// row, because losing a row could alter the conflict / empty-
+// description state admission uses to deny a subject.
+func parseCommitObsLines(prog string, argv []string, b []byte) ([]CommitObs, error) {
+	out := []CommitObs{}
+	for _, line := range strings.Split(string(b), "\n") {
+		if line == "" {
+			continue
+		}
+		fields := strings.SplitN(line, "|", 4)
+		if len(fields) != 4 {
+			return nil, &ErrJJParseFailed{
+				Program: prog,
+				Argv:    argv,
+				Kind:    "commit-obs",
+				Line:    line,
+				Reason:  fmt.Sprintf("expected 4 pipe-separated fields, got %d", len(fields)),
+			}
+		}
+		commitID := fields[0]
+		changeID := fields[1]
+		conflictRaw := fields[2]
+		firstLine := fields[3]
+
+		if commitID == "" {
+			return nil, &ErrJJParseFailed{
+				Program: prog, Argv: argv, Kind: "commit-obs", Line: line,
+				Reason: "commit_id must be non-empty",
+			}
+		}
+		if changeID == "" {
+			return nil, &ErrJJParseFailed{
+				Program: prog, Argv: argv, Kind: "commit-obs", Line: line,
+				Reason: "change_id must be non-empty",
+			}
+		}
+		if conflictRaw != "true" && conflictRaw != "false" {
+			return nil, &ErrJJParseFailed{
+				Program: prog, Argv: argv, Kind: "commit-obs", Line: line,
+				Reason: fmt.Sprintf("conflict field must be true|false, got %q", conflictRaw),
+			}
+		}
+		// firstLine is allowed to be empty (that is precisely the
+		// signal admission uses to detect EMPTY_DESCRIPTION).
+		out = append(out, CommitObs{
+			CommitRef: CommitRef{
+				CommitID: commitID,
+				ChangeID: changeID,
+			},
+			Conflict:  conflictRaw == "true",
+			FirstLine: firstLine,
 		})
 	}
 	return out, nil

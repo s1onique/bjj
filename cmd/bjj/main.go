@@ -1,9 +1,10 @@
 // Command bjj is the Bounded Jujutsu CLI.
 //
-// During ACT-BJJ-PLAN01 the surface is:
+// During ACT-BJJ-ADMISSION01 the surface is:
 //
 //	bjj version [--json]
-//	bjj plan --remote <R> --bookmark <B> [--json]
+//	bjj plan    --remote <R> --bookmark <B> [--json]
+//	bjj admit   --remote <R> --bookmark <B> [--json]
 //
 // All other planned commands (check, publish, status, receipt) are
 // explicitly deferred to subsequent ACTs.
@@ -46,6 +47,7 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "  version          print BJJ build identity (text)")
 		fmt.Fprintln(stderr, "  version --json   print BJJ build identity (strict JSON)")
 		fmt.Fprintln(stderr, "  plan             describe the publication subject for (remote, bookmark)")
+		fmt.Fprintln(stderr, "  admit            determine whether a publication subject is admission-eligible")
 		return exitInvalidArgs
 	}
 	switch argv[0] {
@@ -53,14 +55,18 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		return cmdVersion(argv[1:], stdout, stderr)
 	case "plan":
 		return runPlan(argv[1:], stdout, stderr)
+	case "admit":
+		return runAdmit(argv[1:], stdout, stderr)
 	case "help", "--help", "-h":
 		fmt.Fprintln(stdout, "usage: bjj <command> [args]")
 		fmt.Fprintln(stdout, "")
 		fmt.Fprintln(stdout, "commands:")
 		fmt.Fprintln(stdout, "  version          print BJJ build identity (text)")
 		fmt.Fprintln(stdout, "  version --json   print BJJ build identity (strict JSON)")
-		fmt.Fprintln(stdout, "  plan --remote <R> --bookmark <B> [--json]")
+		fmt.Fprintln(stdout, "  plan    --remote <R> --bookmark <B> [--json]")
 		fmt.Fprintln(stdout, "                  describe the publication subject for (R, B)")
+		fmt.Fprintln(stdout, "  admit   --remote <R> --bookmark <B> [--json]")
+		fmt.Fprintln(stdout, "                  determine whether the publication subject is admission-eligible")
 		return exitOK
 	default:
 		fmt.Fprintf(stderr, "bjj: unknown command %q\n", argv[0])
