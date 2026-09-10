@@ -78,14 +78,35 @@ or human-only formats where machine parsability is expected.
 
 The BJJ publication boundary is **partially implemented**:
 
-- `internal/plan` (`bjj plan`) — ACT-BJJ-PLAN01 closed: freezes
+- `internal/plan` (`bjj plan`) — ACT-BJJ-PLAN01 FROZEN: freezes
   the canonical publication subject.
 - `internal/admission` (`bjj admit`) — ACT-BJJ-ADMISSION01
-  closed: evaluates the frozen subject against an explicit
+  FROZEN: evaluates the frozen subject against an explicit
   policy and emits a typed decision (`admit` | `deny` |
-  `not_needed`).
-- `internal/verify`, `internal/publish`, `internal/receipt` —
-  **not yet implemented**.
+  `not_needed`). The freeze threshold is `false admit | false
+  deny | mixed repository view | authority-boundary violation`;
+  none of those defects remains demonstrated.
+- `internal/check` (`bjj check`) — ACT-BJJ-CHECK01 FROZEN
+  (CORRECTION01 incorporated): materializes the frozen
+  candidate tree from the SAME `(opID, NEW)` view that
+  produced the `PublishPlan`, runs the v1 check profile
+  (`gofmt -l .`, `go vet ./...`, `go test -count=1 ./...`,
+  `go build ./...`) against it with `GOFLAGS=-mod=readonly`,
+  and emits a canonical `CheckResult` plus a separate
+  `CheckObservation` carrying diagnostics
+  (`source_operation_id`, per-check workspace paths, bounded
+  stdout/stderr captures). `SubjectIdentity` is the same
+  4-field shape as admission. Each `CheckSpec` runs in its
+  own disposable workspace (per-check fresh materialisation),
+  tree entries are typed (`file | symlink | git-submodule |
+  conflict | tree`), and symlink/submodule/unsupported kinds
+  fail closed with `CHECK_UNSUPPORTED_TREE_ENTRY`. Source
+  worktree is read-only; no `jj` mutating subcommand is
+  invoked. Next ACT: ACT-BJJ-EVIDENCE01 — Bind Verification
+  Evidence to Publication Subject (`SubjectDigest`, evidence
+  file, replay-equivalence).
+- `internal/publish`, `internal/receipt` — **not yet
+  implemented**. Next ACT after EVIDENCE01.
 
 Do not attempt to push this repository automatically. The user
 will decide the publication step separately because the very

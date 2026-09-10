@@ -1,10 +1,18 @@
 # ACT-BJJ-ADMISSION01 — Publication Subject Admission Boundary
 
-**Status:** IMPL — closed (CORRECTION01 + CORRECTION02 + CORRECTION03 applied).
+**Status:** IMPL — FROZEN (CORRECTION01 + CORRECTION02 + CORRECTION03 applied).
 
 **Project:** Bounded Jujutsu (bjj)
 
 **Repository:** https://github.com/s1onique/bjj
+
+The freeze threshold is `false admit | false deny | mixed repository view |
+authority-boundary violation`. No defect of any of those classes remains
+demonstrated; the ACT is sealed against the next ACT (CHECK01), which
+must answer the much stronger question "did the sanctioned verifier
+actually prove the required properties **for this exact frozen
+subject**" rather than merely run some commands somewhere in the
+repository.
 
 ## VERDICT
 
@@ -687,7 +695,7 @@ ok      github.com/s1onique/bjj/internal/plan      41.6s
 ok      github.com/s1onique/bjj/internal/version   1.67s
 ```
 
-Total: 139 tests, all PASS (9 new since the previous digest: 9
+Total: 141 tests, all PASS (10 new since the previous digest: 9
 CORRECTION03 policy-view-binding tests in
 `internal/admission/correction03_test.go`, including
 adversarial mid-mutation fixtures and an adapter input-validation

@@ -5,9 +5,10 @@ transaction pipeline that crosses from one zone to another.
 
 > The architecture document records **intended** structure. Only the
 > parts marked **Implemented in ACT-BJJ-LAB01**,
-> **Implemented in ACT-BJJ-PLAN01**, or **Implemented in
-> ACT-BJJ-ADMISSION01** have been built. Everything after
-> ADMISSION01 is **future architecture**.
+> **Implemented in ACT-BJJ-PLAN01**, **Implemented in
+> ACT-BJJ-ADMISSION01** (FROZEN), or **Implemented in
+> ACT-BJJ-CHECK01** (FROZEN) have been built. Everything after
+> CHECK01 is **future architecture**.
 
 ## Trust zones
 
@@ -49,7 +50,7 @@ PLAN_FROZEN        [implemented in ACT-BJJ-PLAN01]
   ↓
 ADMITTED           [implemented in ACT-BJJ-ADMISSION01]
   ↓
-CHECKED
+CHECKED            [implemented in ACT-BJJ-CHECK01 — FROZEN]
   ↓
 EVIDENCE_BOUND
   ↓
@@ -72,6 +73,7 @@ Status meanings:
 | PLAN_FROZEN         | Capture an immutable plan describing what will publish.   |
 | ADMITTED            | The candidate has passed pre-flight gates.                |
 | CHECKED             | Verifications (policies, signatures, hashes) have run.    |
+|                     | (Implemented in ACT-BJJ-CHECK01 — FROZEN.)                 |
 | EVIDENCE_BOUND      | The plan is bound to verifiable evidence.                 |
 | PLAN_REVALIDATED    | The bound plan is re-checked just before transport.       |
 | CAPABILITY_ACQUIRED | A scoped, short-lived capability has been issued.         |
@@ -276,6 +278,18 @@ admission decision.
 the provenance of repository-local policy bytes but does NOT
 make that policy authoritative. Authoritative policy remains
 deferred to a later ACT.
+
+### Freeze
+
+ACT-BJJ-ADMISSION01 is **FROZEN** against the threshold
+`false admit | false deny | mixed repository view |
+authority-boundary violation`. None of those defect classes
+remains demonstrated after CORRECTION03. The next ACT is
+**ACT-BJJ-CHECK01 — Bound Factory Verification to Admitted
+Subject**, which must answer "did the sanctioned verifier
+actually prove the required properties **for this exact frozen
+subject**" rather than merely run some commands somewhere in
+the repository.
 
 ### New packages
 
@@ -523,6 +537,309 @@ or observation-specific fields. `source_operation_id` and
 `repository_path` live in a separate `PlanObservation` envelope
 returned by `plan.ResolveObserved`; they are diagnostic only and
 do not participate in canonical subject comparison.
+
+## Implemented in ACT-BJJ-CHECK01-CORRECTION01 — Bound Factory Verification to Admitted Subject
+
+`bjj check` is the factory verification stage. It proves that the
+sanctioned verifier actually executed the required checks against
+the exact frozen candidate tree, bound to the same `PlanSubject`
+that `bjj admit` admitted. `bjj check` is read-only with respect
+to the source repository: the source worktree is never modified,
+no `jj new`/`jj describe`/`jj squash`/`jj rebase`/etc. is invoked,
+and no `jj git fetch`/`jj git push` is performed.
+
+### New packages
+
+- `internal/check` — `types`, `errors`, `runner`, `materialize`,
+  `aggregate`, `profile`, `orchestrator`, `render`, `jjsource`.
+
+### Per-check fresh workspace (CRITICAL)
+
+For every `CheckSpec`, the orchestrator executes a strict
+5-step loop:
+
+```text
+for each spec:
+    materialize(spec)            <- fresh os.MkdirTemp("bjj-check-...")
+    reverify(workspaceDir)       <- re-walk + SHA-256 manifest compare
+    runner.Run(spec, workspaceDir)
+    capture diagnostic           <- ResolvedProgram, stdout, stderr, ...
+    cleanup(os.RemoveAll)        <- per-check workspace disappears
+```
+
+The pre-CORRECTION01 implementation allocated ONE workspace
+for the whole profile and ran every check against it; a check
+that mutated its input could contaminate the next check.
+CORRECTION01 splits the loop into a per-spec iteration so
+check N cannot leak state into check N+1.
+
+The materializer always allocates its workspace via
+`os.MkdirTemp(parentDir, "bjj-check-<revision>-")` — never
+via a deterministic `os.Mkdir` — so two calls with the same
+revision still get different directories. The static guard
+`TestCheckWorkspaceAlwaysFreshDirectory` in
+`internal/plan/safety_test.go` walks `internal/check/` and
+fails the build if any `.go` file contains both `os.Mkdir(`
+and the literal `"bjj-check-` prefix.
+
+### Per-spec orchestrator pipeline
+
+For each spec:
+
+1. **Materialize**: walk the candidate tree from the SAME
+   frozen `opID`/`revision`, list entries via
+   `jj file list` (typed tree entries), and copy each file
+   into a fresh disposable workspace under
+   `os.MkdirTemp(parentDir, "bjj-check-<rev>-")`. Each path
+   is rejected on escape (`..`, absolute, NUL). Context
+   cancellation aborts the materialize and removes the temp
+   directory (verdict §20).
+2. **Pre-exec reverify**: re-read the materialized workspace
+   with `os.Lstat` (which exposes kind + mode) and SHA-256 each
+   file; compare against the manifest emitted by the
+   materializer (which covers `(Path, Kind, Executable, Mode,
+   ContentSHA256)`). Mismatch → `CodeWorkspaceChanged`
+   (verdict §18).
+3. **Run profile**: execute the v1 profile (`gofmt -l .`,
+   `go vet ./...`, `go test -count=1 ./...`, `go build ./...`)
+   in the disposable workspace with a per-check timeout,
+   bounded I/O, a per-workspace `GOCACHE`, and
+   `GOFLAGS=-mod=readonly` so the candidate cannot rewrite
+   `go.mod`/`go.sum` to make itself pass.
+4. **Capture diagnostic**: extract the resolved executable
+   path (`exec.LookPath`), stdout/stderr, wall-clock duration,
+   workspace path into `CheckDiagnostic` — NOT the canonical
+   outcome.
+5. **Cleanup**: `os.RemoveAll(workspaceDir)` so the next
+   check's fresh workspace has no chance of inheriting
+   poisoned bytes.
+
+### v1 check profile (tree-local only)
+
+```text
+id           program    argv
+----------------------------------------------------
+gofmt        gofmt      -l .
+go_vet       go         vet ./...
+go_test      go         test -count=1 ./...
+go_build     go         build ./...
+```
+
+Per-check timeouts default to 30s (`gofmt`) / 60s (`go vet`,
+`go build`) / 120s (`go test`). Output is truncated at 1 MiB
+per stream; truncation is recorded but not surfaced as
+PASS/FAIL (verdict §10).
+
+### Typed tree entries (fail closed)
+
+`jj file list -T '<template>'` returns typed
+`TreeEntry { Path, Kind, Executable }` records where
+`Kind ∈ {file, symlink, git-submodule, conflict, tree}`.
+The materializer maps these onto the manifest:
+
+| jj kind         | Manifest behaviour                                        |
+|-----------------|-----------------------------------------------------------|
+| `file`          | written with `Mode = 0o755` if `Executable`, else `0o644` |
+| `symlink`       | `CodeUnsupportedTreeEntry` (verdict §12)                  |
+| `git-submodule` | `CodeUnsupportedTreeEntry`                                |
+| `conflict`      | `CodeUnsupportedTreeEntry`                                |
+| `tree`          | `CodeUnsupportedTreeEntry` (no recursion in CHECK01)      |
+| unknown         | `CodeUnsupportedTreeEntry` (defence-in-depth)             |
+
+Silently coercing a symlink or submodule into a regular file
+would falsify the durable claim that the workspace is an
+exact materialization of the frozen tree, so the materializer
+fails closed.
+
+### Canonical vs observation split
+
+`CheckResult` (canonical) and `CheckObservation` (diagnostic)
+are two separate types, mirroring PLAN01's `PublishPlan` /
+`PlanObservation` split:
+
+```text
+CheckResult
+  SchemaVersion
+  Status
+  Subject         {Remote, Bookmark, OldCommitID, NewCommitID}  (4 fields)
+  Checks[]        {ID, Status, ExitCode, ErrorCode, ErrorMessage,
+                   Program, Argv}
+  FileCount
+
+CheckObservation
+  Result                     <- embedded CheckResult above
+  SourceOperationID          <- observation provenance only
+  ResolvedAbsoluteWorkspace  <- diagnostic
+  Diagnostics[]
+    {ID, ResolvedProgram, Argv, WorkspacePath, Stdout, Stderr,
+     StdoutTruncated, StderrTruncated, DurationMillis}
+```
+
+`CheckOutcome` (inside `CheckResult.Checks`) carries the
+canonical fields; diagnostic fields (`ResolvedProgram`,
+`Stdout`, `Stderr`, `WorkspacePath`, `DurationMillis`,
+`StdoutTruncated`, `StderrTruncated`) carry `json:"-"` and
+live exclusively on `CheckDiagnostic`. They never leak into
+the canonical body.
+
+`SourceOperationID` is observation provenance only. It is
+NOT part of the canonical `SubjectIdentity` (which has
+exactly 4 fields). Carrying opID in the subject would tie
+the canonical body to the host's local Jujutsu operation
+log — wrong abstraction level for a "subject is the
+frozen intent, not the local view of it" design.
+
+### Subject-identity binding (structural, not cryptographic)
+
+`CheckSubject.AsSubjectIdentity()` produces the
+`SubjectIdentity` carried in `CheckResult.Subject`. It has
+EXACTLY four fields:
+
+```text
+(remote, bookmark, old_commit_id, new_commit_id)
+```
+
+This is structurally equal (same Go struct shape, same JSON
+fields) to `admission.SubjectIdentity`. Callers can prove
+`CHECK_SUBJECT == ADMITTED_SUBJECT` by string equality on
+those four fields. `SubjectDigest` (cryptographic binding) is
+explicitly deferred to EVIDENCE01.
+
+### Canonical program identity (host-independent)
+
+`CheckSpec.Program` carries a LOGICAL name (`"go"`,
+`"gofmt"`), NOT an absolute path. The Runner resolves the
+absolute path via `exec.LookPath` at run time and records
+it ONLY in `CheckObservation.Diagnostics[].ResolvedProgram`
+(which carries `json:"-"` on `CheckOutcome`).
+
+This keeps canonical `CheckResult` JSON byte-identical
+regardless of where `go` lives on disk:
+
+| Host            | `Diagnostics.ResolvedProgram`        | `CheckResult.Program` |
+|-----------------|--------------------------------------|-----------------------|
+| NixOS           | `/nix/store/aaa-go-1.26.6/bin/go`    | `go`                  |
+| Ubuntu          | `/usr/local/go/bin/go`               | `go`                  |
+| macOS Homebrew  | `/opt/homebrew/bin/go`               | `go`                  |
+
+The cross-host invariant is proved by
+`TestCanonicalCrossHostProgramInvariant`.
+
+### Materialization proof
+
+Materialization is proved by the post-materialization walk +
+SHA-256 reverify, comparing against the materializer's emitted
+manifest. The manifest covers `(Path, Kind, Executable, Mode,
+ContentSHA256)` so chmod tampering and post-materialize kind
+switches both surface as `CodeWorkspaceChanged`. The injected
+`ReMaterializeForVerify` lets tests substitute a faker to
+simulate tampering without filesystem races (verdict §18).
+
+### Strict failure-mode separation
+
+`StatusError` (infrastructure: timeout, missing executable,
+materialization failure, workspace changed, subject mismatch)
+is distinct from `StatusFail` (subject property: `go test`
+exits 1). Aggregation folds: any ERROR → `error`; else any
+FAIL → `fail`; else `pass`.
+
+### No-transport, no-jj-mutation, no-mod-overlay guarantees
+
+The AST guard in `internal/plan/safety_test.go`:
+
+- extends `TestPlanLayerHasNoTransport` to cover `internal/check`
+  and `cmd/bjj/check.go`;
+- introduces `TestCheckLayerHasNoJJMutation` which scans all
+  `cmd.Exec`/`exec.Command` argv composite literals and rejects
+  any of the mutating `jj` subcommands (`new`, `describe`,
+  `squash`, `bookmark set`, `bookmark create`, `bookmark delete`,
+  `bookmark rename`, `bookmark track`, `bookmark untrack`,
+  `commit`, `rebase`, `abandon`, `diffedit`, `edit`, `split`,
+  `restore`, `duplicate`, `move`, `merge`, `resolve`, `sign`).
+- introduces `TestCheckLayerGoModuleReadOnly` which scans
+  `internal/check/` and fails the build if any `.go` file
+  sets `GOFLAGS=-mod=mod` (the unsafe overlay that lets a
+  candidate rewrite its own module metadata). The required
+  overlay is `GOFLAGS=-mod=readonly`.
+- introduces `TestCheckWorkspaceAlwaysFreshDirectory` which
+  scans `internal/check/` and fails the build if any `.go`
+  file contains both `os.Mkdir(` and the literal
+  `"bjj-check-` prefix (forcing every workspace allocation
+  through `os.MkdirTemp`).
+
+The only `jj` invocations made by `internal/check` are
+read-only operations (`jj file list -r ... --ignore-working-copy
+--no-integrate-operation --at-op=<opID>` and `jj --at-op=<opID>
+file show -r <rev> <path>`), both of which operate against the
+pinned operation view.
+
+### New CLI surface
+
+```text
+bjj check --remote <R> --bookmark <B> [--json]
+```
+
+The repository directory is the current working directory. No
+`<dir>` positional, no `--revision`, `--current`, `--all`,
+`--stack`, or `--no-reverify` flags: every such escape hatch
+would weaken binding to the admitted subject (verdict §3). Exit
+codes:
+
+```text
+0   pass      every check in the profile returned StatusPass
+1   fail      at least one check returned StatusFail
+2   error     infrastructure failure (timeout, materialization,
+              workspace changed, subject mismatch, etc.)
+3   denied    admission did not produce ADMIT
+4   usage     bad arguments or unknown flag
+```
+
+### Properties
+
+- **`SubjectIdentity` is structurally equal** to the one admitted
+  by `bjj admit` — exact same 4 fields
+  `(remote, bookmark, old_commit_id, new_commit_id)`
+  (verdict §13/§15).
+- **Canonical body has no opID**, no workspace path, no
+  resolved executable, no stdout/stderr, no duration. The
+  observation envelope carries those separately
+  (verdict §5/§6).
+- **Per-check fresh workspace**: check N's mutation cannot
+  leak into check N+1's input. The orchestrator runs
+  `materialize → reverify → run → cleanup` for every
+  CheckSpec and the materializer uses `os.MkdirTemp`
+  per call (verdict §1).
+- **Canonical program is logical** (`"go"`, `"gofmt"`), not
+  host-dependent — same canonical bytes on every host
+  (verdict §7).
+- **`GOFLAGS=-mod=readonly`** — candidates cannot rewrite
+  their module metadata to "make themselves pass"
+  (verdict §2).
+- **Typed tree entries**: symlinks, git-submodules, conflicts,
+  and unknown kinds fail closed with `CodeUnsupportedTreeEntry`
+  (verdict §12).
+- **Executable bit preserved**: file with `Executable=true` in
+  the tree is written with mode `0o755`; manifest binds kind +
+  executable so chmod tampering surfaces as `CodeWorkspaceChanged`.
+- **Repeated-execution canonical result is byte-identical**:
+  two runs against the same frozen subject at the same opID
+  produce byte-equal canonical JSON (verdict §7).
+- **Materialized workspace integrity** is proved by the SHA-256
+  reverify; tampering (live or post-materialize) yields
+  `CodeWorkspaceChanged` and status `error` (verdict §18/§19).
+- **Source worktree is read-only**: the source repository is
+  never opened for write; no `jj` mutating subcommand is invoked
+  (verdict §22).
+- **Profile determinism**: outcomes are sorted by `CheckID`;
+  canonical JSON for a given inputs set is byte-identical
+  regardless of execution order (verdict §24).
+- **No diagnostic leakage**: `WorkspacePath`,
+  `DurationMillis`, `ResolvedProgram`, `Stdout`, `Stderr`,
+  `StdoutTruncated`, `StderrTruncated` never appear in canonical
+  JSON; they live exclusively on `CheckDiagnostic`
+  (verdict §6/§25).
+- **Profile-only**: the v1 profile contains no PATCH_HYGIENE,
+  TEST_HYGIENE, or remote checks (verdict §8).
 
 ## Explicit non-goals (deferred from ACT-PLAN01)
 

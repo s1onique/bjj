@@ -53,9 +53,56 @@ remote hosting = final shared authority
 
 ## Current ACT
 
-This repository is at **ACT-BJJ-ADMISSION01 — Publication Subject
-Admission Boundary** (with CORRECTION01, CORRECTION02, and
-CORRECTION03 incorporated; builds on ACT-BJJ-PLAN01). The act adds:
+**FROZEN — ACT-BJJ-CHECK01-CORRECTION01 — Bound Factory Verification
+to Admitted Subject** (builds on the FROZEN ACT-BJJ-ADMISSION01).
+CHECK01 is frozen after the freeze-cleanup pass: per-check fresh
+workspace, logical canonical program identity, host-independent
+canonical JSON, `GOFLAGS=-mod=readonly`, typed tree entries, and
+the canonical/observation split are all in place and guarded.
+
+The CHECK01-CORRECTION01 implementation passes all unit, integration,
+and structural tests against real `jj 0.41.0`:
+
+- 200 tests pass, 0 fail (aggregate count reported by `go test`;
+  durable property tests + static AST guards listed below).
+- 7 integration tests against real `jj` via `internal/lab`.
+- 12 new adversarial tests for the CORRECTION01 gates
+  (per-check fresh workspace, executable bit preserved, symlink /
+  git-submodule / unknown-kind fail closed, chmod + kind tampering
+  detected, `CheckObservation` split, repeated-execution canonical
+  result identical, `GOFLAGS=-mod=readonly` regression guard).
+- 4 new fossil guards in `internal/check/docs_test.go` for the
+  freeze-cleanup documentation contracts (4-field subject identity,
+  opID observation-only, v1-profile timeouts, program-identity
+  contract).
+- `internal/check` is structurally free of transport, `jj`
+  mutating subcommands, and `GOFLAGS=-mod=mod` overlay (AST guards
+  in `internal/plan/safety_test.go`).
+
+The CHECK01-CORRECTION01 ACT adds:
+
+- **Per-check fresh workspace** — each `CheckSpec` runs in its
+  own disposable materialization; a check cannot contaminate the
+  input of the next (`CHECK_FRESH_WORKSPACE_PER_CHECK`).
+- **`GOFLAGS=-mod=readonly`** overlay on every `go` subcommand —
+  candidates that need to mutate `go.mod` / `go.sum` to verify
+  themselves fail / error instead of being silently repaired.
+- **Typed tree entries** — `TreeEntry { Path, Kind, Executable }`
+  where `Kind ∈ {file, symlink, git-submodule, conflict, tree}`.
+  Symlinks, git-submodules, conflicts, and unknown kinds fail
+  closed with `CHECK_UNSUPPORTED_TREE_ENTRY`.
+- **Executable bit preserved** at materialization and verified at
+  pre-exec re-verify (mode + kind bound to manifest).
+- **Canonical `CheckResult` / observation split** mirroring
+  PLAN01's `PublishPlan` / `PlanObservation`. Canonical body has
+  no `source_operation_id`, no workspace paths, no stdout/stderr,
+  no resolved-program path. `CheckObservation` carries those
+  diagnostics separately.
+- **Repeated execution canonical result is byte-identical** —
+  two successful runs of the same frozen subject at the SAME
+  opID produce byte-identical canonical JSON.
+
+The earlier FROZEN ACT adds:
 
 - a typed `PublishPlan` domain model (`internal/plan`),
 - a bounded `jj` adapter (`internal/jjadapter`) that never invokes
@@ -69,9 +116,13 @@ CORRECTION03 incorporated; builds on ACT-BJJ-PLAN01). The act adds:
 
 PLAN01 freezes the publication subject. ADMISSION01 evaluates that
 subject against an explicit policy and emits a typed decision.
-Both ACTs deliberately do **not** implement `bjj publish`. Evidence
-binding, transport, and remote verification belong to subsequent
-ACTs.
+CHECK01 runs the v1 check profile against the frozen candidate
+tree and binds the result to the admitted subject. None of these
+ACTs implements `bjj publish`. Evidence binding (`SubjectDigest`),
+transport, and remote verification belong to subsequent ACTs.
+
+Next ACT: **ACT-BJJ-EVIDENCE01 — Bind Verification Evidence to
+Publication Subject**.
 
 ### ADMISSION01-CORRECTION01
 
@@ -177,8 +228,11 @@ See:
   pipeline.
 - `docs/acts/ACT-BJJ-LAB01.md` for the laboratory baseline.
 - `docs/acts/ACT-BJJ-PLAN01.md` for the plan primitive contract.
-- `docs/acts/ACT-BJJ-ADMISSION01.md` for the admission boundary
-  (now including CORRECTION01, CORRECTION02, and CORRECTION03).
+- `docs/acts/ACT-BJJ-ADMISSION01.md` for the FROZEN admission
+  boundary (including CORRECTION01, CORRECTION02, and
+  CORRECTION03).
+- `docs/acts/ACT-BJJ-CHECK01.md` for the bound factory
+  verification to admitted subject.
 
 ## Command surface
 

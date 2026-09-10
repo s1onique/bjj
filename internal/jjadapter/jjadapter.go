@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/s1onique/bjj/internal/execx"
@@ -537,6 +538,192 @@ func (a *Adapter) FileShowAtOp(ctx context.Context, dir, opID, revision, path st
 // signatures).
 func isAbsentFileShowStderr(s string) bool {
 	return strings.Contains(s, "No such path")
+}
+
+// TreeEntryKind enumerates the kinds of tree entries the
+// adapter recognises. The values match Jujutsu's `file_type()`
+// template method output verbatim.
+type TreeEntryKind string
+
+const (
+	// TreeEntryFile is a regular file.
+	TreeEntryFile TreeEntryKind = "file"
+	// TreeEntrySymlink is a symbolic link.
+	TreeEntrySymlink TreeEntryKind = "symlink"
+	// TreeEntryGitSubmodule is a Git submodule pointer.
+	TreeEntryGitSubmodule TreeEntryKind = "git-submodule"
+	// TreeEntryConflict is an unresolved merge conflict.
+	TreeEntryConflict TreeEntryKind = "conflict"
+	// TreeEntryTree is a directory placeholder (jj's
+	// `file list` does not currently emit these, but the
+	// kind is reserved so the parser accepts future
+	// expansions).
+	TreeEntryTree TreeEntryKind = "tree"
+)
+
+// TreeEntry is the typed view of one `jj file list` row.
+//
+// Fields:
+//
+//	Path       - repo-relative path (forward-slash separated,
+//	             normalised via filepath.Clean).
+//	Kind       - one of TreeEntryFile / Symlink / GitSubmodule /
+//	             Conflict / Tree (or empty when the underlying
+//	             jj does not advertise the kind).
+//	Executable - true only when the entry is a regular file
+//	             with the executable bit set.
+//
+// TreeEntry values are immutable after construction.
+type TreeEntry struct {
+	Path       string
+	Kind       TreeEntryKind
+	Executable bool
+}
+
+// ListTreeEntries returns the typed, sorted list of tree
+// entries in revision as visible at opID.
+//
+// Emitted via:
+//
+//	jj --at-op=<opID> file list -r <revision> -T <template>
+//
+// The template emits one tab-separated tuple per line:
+//
+//	<path>\t<file_type>\t<executable>
+//
+// `<executable>` is "true" or "false". `<file_type>` is one of
+// the values documented on the TreeEntryKind type. An unknown
+// value is preserved verbatim so callers can decide what to
+// do (CHECK01 currently fails closed).
+//
+// The list is sorted lexicographically by the parser so callers
+// see deterministic ordering regardless of jj's internal
+// walk order.
+//
+// CHECK01-CORRECTION01: this method replaces the bare-path
+// `ListFiles`; CHECK01 no longer relies on losing the
+// executable bit / kind to a string-only representation.
+func (a *Adapter) ListTreeEntries(ctx context.Context, dir, opID, revision string) ([]TreeEntry, error) {
+	if opID == "" {
+		return nil, &ErrJJFailed{
+			Program:  "jj",
+			Argv:     []string{"file", "list", "-r", revision},
+			ExitCode: -1,
+			Stderr:   "jjadapter.ListTreeEntries: opID is empty; refusing to read from the live operation",
+		}
+	}
+	if revision == "" {
+		return nil, &ErrJJFailed{
+			Program:  "jj",
+			Argv:     []string{"--at-op=" + opID, "file", "list"},
+			ExitCode: -1,
+			Stderr:   "jjadapter.ListTreeEntries: revision is empty; refusing to read from the live workspace",
+		}
+	}
+	// The template emits one row per entry:
+	//
+	//   path ++ "\t" ++ file_type ++ "\t" ++ executable ++ "\n"
+	//
+	// This is the minimum Jujutsu 0.41.0 supports for the
+	// TreeEntry shape we need (path / file_type / executable).
+	const tmpl = `path ++ "\t" ++ file_type ++ "\t" ++ executable ++ "\n"`
+	argv := []string{
+		"file", "list",
+		"-r", revision,
+		"-T", tmpl,
+		"--ignore-working-copy",
+		"--no-integrate-operation",
+		"--at-op=" + opID,
+	}
+	res := a.run(ctx, dir, argv)
+	if res.Err != nil {
+		return nil, &ErrJJFailed{
+			Program:  res.program,
+			Argv:     argv,
+			ExitCode: res.ExitCode,
+			Stderr:   string(res.Stderr),
+			Cause:    res.Err,
+		}
+	}
+	out := []TreeEntry{}
+	for _, raw := range strings.Split(string(res.Stdout), "\n") {
+		line := strings.TrimRight(raw, "\r")
+		if line == "" {
+			continue
+		}
+		fields := strings.Split(line, "\t")
+		if len(fields) < 3 {
+			return nil, &ErrJJParseFailed{
+				Program: res.program,
+				Argv:    argv,
+				Kind:    "tree-entry",
+				Line:    line,
+				Reason:  fmt.Sprintf("expected at least 3 tab-separated fields, got %d", len(fields)),
+			}
+		}
+		rawPath := fields[0]
+		rawKind := fields[1]
+		rawExec := fields[2]
+		if strings.Contains(rawPath, "\x00") {
+			return nil, &ErrJJParseFailed{
+				Program: res.program,
+				Argv:    argv,
+				Kind:    "tree-entry",
+				Line:    line,
+				Reason:  "path contains NUL byte",
+			}
+		}
+		if rawExec != "true" && rawExec != "false" {
+			return nil, &ErrJJParseFailed{
+				Program: res.program,
+				Argv:    argv,
+				Kind:    "tree-entry",
+				Line:    line,
+				Reason:  fmt.Sprintf("executable field must be true|false, got %q", rawExec),
+			}
+		}
+		cleanPath := filepath.ToSlash(filepath.Clean(rawPath))
+		if cleanPath == "." || cleanPath == "" {
+			// Defensive: an empty path usually means the
+			// template yielded the workspace root as a
+			// directory entry. Skip rather than emit a
+			// bogus "" row.
+			continue
+		}
+		out = append(out, TreeEntry{
+			Path:       cleanPath,
+			Kind:       TreeEntryKind(rawKind),
+			Executable: rawExec == "true",
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
+	return out, nil
+}
+
+// ShowFile returns the bytes of path in revision as visible at
+// opID. It is a thin wrapper over FileShowAtOp that rejects the
+// FilePresenceAbsent case (which the materializer treats as a
+// hard failure: a file that was listed by ListFiles MUST be
+// readable; absence means the workspace tree is inconsistent).
+//
+// Any infrastructure error from `jj file show` is propagated
+// verbatim.
+func (a *Adapter) ShowFile(ctx context.Context, dir, opID, revision, path string) ([]byte, error) {
+	body, presence, err := a.FileShowAtOp(ctx, dir, opID, revision, path)
+	if err != nil {
+		return nil, err
+	}
+	if presence == FilePresenceAbsent {
+		return nil, &ErrJJFailed{
+			Program: "jj",
+			Argv:    []string{"--at-op=" + opID, "file", "show", "-r", revision, path},
+			// No process was started; surface as -1 so callers do
+			// not mistake this for a real exit code.
+			ExitCode: -1,
+			Stderr:   "jjadapter.ShowFile: file listed by ListFiles but absent on show (inconsistent tree)",
+		}
+	}
+	return body, nil
 }
 
 // run executes jj under the adapter's environment policy and

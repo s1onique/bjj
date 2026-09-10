@@ -1,12 +1,13 @@
 // Command bjj is the Bounded Jujutsu CLI.
 //
-// During ACT-BJJ-ADMISSION01 the surface is:
+// During ACT-BJJ-CHECK01 the surface is:
 //
 //	bjj version [--json]
 //	bjj plan    --remote <R> --bookmark <B> [--json]
 //	bjj admit   --remote <R> --bookmark <B> [--json]
+//	bjj check   --remote <R> --bookmark <B> [--json]
 //
-// All other planned commands (check, publish, status, receipt) are
+// All other planned commands (publish, status, receipt) are
 // explicitly deferred to subsequent ACTs.
 package main
 
@@ -48,6 +49,7 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "  version --json   print BJJ build identity (strict JSON)")
 		fmt.Fprintln(stderr, "  plan             describe the publication subject for (remote, bookmark)")
 		fmt.Fprintln(stderr, "  admit            determine whether a publication subject is admission-eligible")
+		fmt.Fprintln(stderr, "  check            run the v1 check profile against an admitted subject")
 		return exitInvalidArgs
 	}
 	switch argv[0] {
@@ -57,6 +59,8 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		return runPlan(argv[1:], stdout, stderr)
 	case "admit":
 		return runAdmit(argv[1:], stdout, stderr)
+	case "check":
+		return runCheck(argv[1:], stdout, stderr)
 	case "help", "--help", "-h":
 		fmt.Fprintln(stdout, "usage: bjj <command> [args]")
 		fmt.Fprintln(stdout, "")
@@ -67,6 +71,8 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stdout, "                  describe the publication subject for (R, B)")
 		fmt.Fprintln(stdout, "  admit   --remote <R> --bookmark <B> [--json]")
 		fmt.Fprintln(stdout, "                  determine whether the publication subject is admission-eligible")
+		fmt.Fprintln(stdout, "  check   --remote <R> --bookmark <B> [--json]")
+		fmt.Fprintln(stdout, "                  run the v1 check profile against an admitted subject")
 		return exitOK
 	default:
 		fmt.Fprintf(stderr, "bjj: unknown command %q\n", argv[0])
