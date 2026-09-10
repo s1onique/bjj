@@ -61,12 +61,12 @@ type Evidence struct {
 // It owns a temporary directory and the paths to its fixture components.
 // Use Setup to construct, defer Cleanup to remove.
 type Lab struct {
-	Root       string
-	Remote     string // bare git remote
-	Seed       string // seed repository
-	GitClient  string // raw git client clone
-	JJClient   string // jj colocated workspace
-	Home       string // scratch HOME for child processes (no credentials)
+	Root      string
+	Remote    string // bare git remote
+	Seed      string // seed repository
+	GitClient string // raw git client clone
+	JJClient  string // jj colocated workspace
+	Home      string // scratch HOME for child processes (no credentials)
 
 	realOrigin string // captured at Setup time so we can prove it is untouched
 }

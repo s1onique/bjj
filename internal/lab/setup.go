@@ -2,9 +2,11 @@ package lab
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // Setup constructs a fresh lab under a temporary directory and seeds
@@ -150,4 +152,173 @@ func (l *Lab) labSeedCandidate(ctx context.Context, jjDir string) error {
 		return err
 	}
 	return nil
+}
+
+// SeedBookmarkPush pushes the named bookmark to the lab remote so a
+// PLAN01 fixture has a known non-absent remote-target.
+func (l *Lab) SeedBookmarkPush(ctx context.Context, bookmark string) error {
+	if l == nil || l.JJClient == "" {
+		return errors.New("lab: SeedBookmarkPush: lab not set up")
+	}
+	return l.runJJ(ctx, l.JJClient, []string{
+		"git", "push",
+		"--remote", "lab",
+		"--bookmark", bookmark,
+		"--allow-empty-description",
+	})
+}
+
+// SeedRemoteMoveTo moves the remote-tracking bookmark on the lab
+// remote by pushing from the raw git client.
+func (l *Lab) SeedRemoteMoveTo(ctx context.Context, bookmark, seedBranch string) error {
+	if l == nil || l.GitClient == "" {
+		return errors.New("lab: SeedRemoteMoveTo: lab not set up")
+	}
+	return l.runGit(ctx, l.GitClient, []string{
+		"push", "-f", "origin",
+		seedBranch + ":" + bookmark,
+	})
+}
+
+// SeedExternalRemoteMove mutates the bare remote's refs/heads/<bookmark>
+// directly via `git update-ref`.
+func (l *Lab) SeedExternalRemoteMove(ctx context.Context, bookmark, commitID string) error {
+	if l == nil || l.Remote == "" {
+		return errors.New("lab: SeedExternalRemoteMove: lab not set up")
+	}
+	return l.runGit(ctx, l.Remote, []string{
+		"update-ref", "refs/heads/" + bookmark, commitID,
+	})
+}
+
+// SeedCreateStackedCommits creates N new stacked commits on top of
+// `base` in the jj client, placing the `stack` bookmark on the
+// topmost commit.
+func (l *Lab) SeedCreateStackedCommits(ctx context.Context, base, descriptionPrefix string, n int) (deepest, topmost string, err error) {
+	if l == nil || l.JJClient == "" {
+		return "", "", errors.New("lab: SeedCreateStackedCommits: lab not set up")
+	}
+	if n <= 0 {
+		return "", "", errors.New("lab: SeedCreateStackedCommits: n must be > 0")
+	}
+
+	if err := l.runJJ(ctx, l.JJClient, []string{"new", base, "-m", descriptionPrefix + " 1"}); err != nil {
+		return "", "", err
+	}
+	if err := l.writeStubFile("stack-1.txt"); err != nil {
+		return "", "", err
+	}
+	d, err := l.jjOutput(ctx, l.JJClient, []string{"log", "--no-graph", "-r", "@", "-T", "commit_id"})
+	if err != nil {
+		return "", "", err
+	}
+	deepest = strings.TrimSpace(d)
+	if err := l.runJJ(ctx, l.JJClient, []string{"bookmark", "create", "stack", "-r", "@"}); err != nil {
+		return "", "", err
+	}
+
+	prev := "@"
+	for i := 2; i <= n; i++ {
+		if err := l.runJJ(ctx, l.JJClient, []string{"new", prev, "-m", fmt.Sprintf("%s %d", descriptionPrefix, i)}); err != nil {
+			return "", "", err
+		}
+		if err := l.writeStubFile(fmt.Sprintf("stack-%d.txt", i)); err != nil {
+			return "", "", err
+		}
+		prev = "@"
+	}
+	if err := l.runJJ(ctx, l.JJClient, []string{"bookmark", "set", "stack", "-r", "@"}); err != nil {
+		return "", "", err
+	}
+	t, err := l.jjOutput(ctx, l.JJClient, []string{"log", "--no-graph", "-r", "@", "-T", "commit_id"})
+	if err != nil {
+		return "", "", err
+	}
+	topmost = strings.TrimSpace(t)
+	return deepest, topmost, nil
+}
+
+// writeStubFile writes a deterministic stub file to the jj client.
+func (l *Lab) writeStubFile(name string) error {
+	if l == nil || l.JJClient == "" {
+		return errors.New("lab: writeStubFile: lab not set up")
+	}
+	p := filepath.Join(l.JJClient, name)
+	return os.WriteFile(p, []byte(name+"\n"), 0o644)
+}
+
+// writeStubFileGit writes a deterministic stub file to the git client.
+func (l *Lab) writeStubFileGit(name string) error {
+	if l == nil || l.GitClient == "" {
+		return errors.New("lab: writeStubFileGit: lab not set up")
+	}
+	p := filepath.Join(l.GitClient, name)
+	return os.WriteFile(p, []byte(name+"\n"), 0o644)
+}
+
+// SeedRewrittenFeature builds a single commit on top of `base`,
+// records its change id and commit id, then rewrites the commit.
+func (l *Lab) SeedRewrittenFeature(ctx context.Context, base string) (changeID, oldCommitID, newCommitID string, err error) {
+	if l == nil || l.JJClient == "" {
+		return "", "", "", errors.New("lab: SeedRewrittenFeature: lab not set up")
+	}
+	if err := l.runJJ(ctx, l.JJClient, []string{"new", base, "-m", "rewrite original"}); err != nil {
+		return "", "", "", err
+	}
+	if err := l.writeStubFile("rewrite-1.txt"); err != nil {
+		return "", "", "", err
+	}
+	cid, err := l.jjOutput(ctx, l.JJClient, []string{"log", "--no-graph", "-r", "@", "-T", "change_id"})
+	if err != nil {
+		return "", "", "", err
+	}
+	changeID = strings.TrimSpace(cid)
+	old, err := l.jjOutput(ctx, l.JJClient, []string{"log", "--no-graph", "-r", "@", "-T", "commit_id"})
+	if err != nil {
+		return "", "", "", err
+	}
+	oldCommitID = strings.TrimSpace(old)
+	if err := l.runJJ(ctx, l.JJClient, []string{"describe", "-m", "rewrite amended"}); err != nil {
+		return "", "", "", err
+	}
+	nc, err := l.jjOutput(ctx, l.JJClient, []string{"log", "--no-graph", "-r", "@", "-T", "commit_id"})
+	if err != nil {
+		return "", "", "", err
+	}
+	newCommitID = strings.TrimSpace(nc)
+	return changeID, oldCommitID, newCommitID, nil
+}
+
+// SeedConflictedBookmark creates a locally-conflicted bookmark by
+// advancing both a raw-git clone and the jj client to diverge from
+// the same starting point, then fetching.
+func (l *Lab) SeedConflictedBookmark(ctx context.Context, bookmark string) error {
+	if l == nil || l.GitClient == "" || l.JJClient == "" {
+		return errors.New("lab: SeedConflictedBookmark: lab not set up")
+	}
+	if err := l.runGit(ctx, l.GitClient, []string{"checkout", "-b", bookmark}); err != nil {
+		return err
+	}
+	if err := l.writeStubFileGit(bookmark + "-via-git.txt"); err != nil {
+		return err
+	}
+	if err := l.runGit(ctx, l.GitClient, []string{"add", bookmark + "-via-git.txt"}); err != nil {
+		return err
+	}
+	if err := l.runGit(ctx, l.GitClient, []string{"commit", "-m", "git-side divergence"}); err != nil {
+		return err
+	}
+	if err := l.runGit(ctx, l.GitClient, []string{"push", "-f", "origin", bookmark}); err != nil {
+		return err
+	}
+	if err := l.runJJ(ctx, l.JJClient, []string{"new", "main", "-m", "jj-side divergence"}); err != nil {
+		return err
+	}
+	if err := l.writeStubFile(bookmark + "-via-jj.txt"); err != nil {
+		return err
+	}
+	if err := l.runJJ(ctx, l.JJClient, []string{"bookmark", "create", bookmark, "-r", "@"}); err != nil {
+		return err
+	}
+	return l.runJJ(ctx, l.JJClient, []string{"git", "fetch", "--remote", "lab"})
 }

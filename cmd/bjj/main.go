@@ -1,11 +1,12 @@
 // Command bjj is the Bounded Jujutsu CLI.
 //
-// During ACT-BJJ-LAB01 the surface is intentionally tiny. The only
-// supported command is `bjj version`, which reports the build-time
-// identity of the binary in either human-readable or strict-JSON form.
+// During ACT-BJJ-PLAN01 the surface is:
 //
-// All other planned commands (plan, check, publish, status, receipt)
-// are explicitly deferred to subsequent ACTs.
+//	bjj version [--json]
+//	bjj plan --remote <R> --bookmark <B> [--json]
+//
+// All other planned commands (check, publish, status, receipt) are
+// explicitly deferred to subsequent ACTs.
 package main
 
 import (
@@ -18,9 +19,6 @@ import (
 
 	"github.com/s1onique/bjj/internal/version"
 )
-
-// exitCode is the canonical exit status for the BJJ CLI.
-const exitCode = 0
 
 // Exit codes used by the CLI:
 //
@@ -47,17 +45,22 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "commands:")
 		fmt.Fprintln(stderr, "  version          print BJJ build identity (text)")
 		fmt.Fprintln(stderr, "  version --json   print BJJ build identity (strict JSON)")
+		fmt.Fprintln(stderr, "  plan             describe the publication subject for (remote, bookmark)")
 		return exitInvalidArgs
 	}
 	switch argv[0] {
 	case "version", "--version", "-v":
 		return cmdVersion(argv[1:], stdout, stderr)
+	case "plan":
+		return runPlan(argv[1:], stdout, stderr)
 	case "help", "--help", "-h":
 		fmt.Fprintln(stdout, "usage: bjj <command> [args]")
 		fmt.Fprintln(stdout, "")
 		fmt.Fprintln(stdout, "commands:")
 		fmt.Fprintln(stdout, "  version          print BJJ build identity (text)")
 		fmt.Fprintln(stdout, "  version --json   print BJJ build identity (strict JSON)")
+		fmt.Fprintln(stdout, "  plan --remote <R> --bookmark <B> [--json]")
+		fmt.Fprintln(stdout, "                  describe the publication subject for (R, B)")
 		return exitOK
 	default:
 		fmt.Fprintf(stderr, "bjj: unknown command %q\n", argv[0])

@@ -52,7 +52,7 @@ var SensitiveEnvPrefixes = []string{
 // SensitiveEnvExact enumerates variable names (not prefixes) stripped
 // unconditionally because they are commonly credential-bearing.
 var SensitiveEnvExact = []string{
-	"HOME",        // BJJ tests should not inherit dev's home/credential helper
+	"HOME", // BJJ tests should not inherit dev's home/credential helper
 	"XDG_CONFIG_HOME",
 	"XDG_CACHE_HOME",
 	"JUJUTSU_CONFIG",

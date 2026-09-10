@@ -105,9 +105,9 @@ func TestRunMissingExecutableReturnsTypedError(t *testing.T) {
 
 func TestRunOutputTruncation(t *testing.T) {
 	res := Run(context.Background(), Request{
-		Program: "/bin/sh",
-		Args:    []string{"-c", "yes A | head -c 200000"},
-		Dir:     useTmpDir(t),
+		Program:        "/bin/sh",
+		Args:           []string{"-c", "yes A | head -c 200000"},
+		Dir:            useTmpDir(t),
 		MaxOutputBytes: 1024,
 	})
 	if res.Err != nil {

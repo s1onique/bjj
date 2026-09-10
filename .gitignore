@@ -5,8 +5,12 @@
 
 # Go test cache (when run inside the repo)
 /.gocache/
+/.gomodcache/
 /coverage.out
 /coverage.txt
+
+# Local jj fixture scratch
+/.jjadapter-home/
 
 # Editor / OS junk
 .DS_Store

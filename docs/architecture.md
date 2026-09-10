@@ -4,8 +4,9 @@ BJJ is designed around a small number of explicit trust zones and a
 transaction pipeline that crosses from one zone to another.
 
 > The architecture document records **intended** structure. Only the
-> parts marked **Implemented in ACT-BJJ-LAB01** have been built.
-> Everything after the laboratory is **future architecture**.
+> parts marked **Implemented in ACT-BJJ-LAB01** or **Implemented in
+> ACT-BJJ-PLAN01** have been built. Everything after PLAN01 is
+> **future architecture**.
 
 ## Trust zones
 
@@ -143,3 +144,106 @@ demonstrate the exact authority leak later ACTs must remove.
 
 These belong to subsequent ACTs. Each will be designed using what
 ACT-LAB01 demonstrates about the real Jujutsu control surface.
+
+## Implemented in ACT-BJJ-PLAN01
+
+PLAN01 closes the **RESOLVE → PLAN_FROZEN** transition.
+
+### New packages
+
+- `internal/jjadapter` — bounded `jj` adapter:
+  - typed records (`CommitRef`, `BookmarkRef`, `Snapshot`,
+    `RemoteRef`, `Op`);
+  - structured argv builders (no shell, no string concatenation);
+  - the subprocess seam enforces the same credential-stripping
+    overlay as `internal/execx`;
+  - adapter never invokes `git push`, `git fetch`, `jj git push`,
+    `jj git fetch`;
+  - `ErrJJFailed` retains program, argv, exit code, and bounded
+    stderr;
+  - `ErrJJParseFailed` (post-CORRECTION02) — typed parse failure
+    raised whenever `jj` output does not match the
+    machine-oriented template. The parser fails closed: any
+    malformed row produces an error rather than being silently
+    skipped or partially-populated. The resolver maps this to
+    `JJ_QUERY_FAILED`.
+- `internal/plan` — domain model and resolver:
+  - `PublishPlan`, `BookmarkMove`, `CommitRef`, `Remote`, `Status`
+    (`planned` | `no_remote_change`);
+  - typed errors with stable `ErrorCode` constants
+    (`REMOTE_NOT_FOUND`, `LOCAL_BOOKMARK_NOT_FOUND`,
+    `LOCAL_BOOKMARK_CONFLICTED`, `REMOTE_BOOKMARK_CONFLICTED`,
+    `NO_REMOTE_CHANGE`, `JJ_QUERY_FAILED`,
+    `INCONSISTENT_REPOSITORY_VIEW`);
+  - `JJSource` / `Source` interface — one operation id is pinned
+    exactly once at `Snapshot()` time; every subsequent
+    `CommitsAt` is bound to that same operation id via
+    `--at-op=<id>`. The source refuses an empty opID with the
+    typed `INCONSISTENT_REPOSITORY_VIEW` error so re-pinning
+    from inside a Resolve is structurally impossible
+    (post-CORRECTION02);
+  - resolver distinguishes NEW bookmark creation from OLD→NEW move
+    using `heads(::NEW & remote_bookmarks())` for the effective
+    `OLD`. A failed effective-old query propagates as
+    `JJ_QUERY_FAILED` rather than silently widening the outgoing
+    set (post-CORRECTION02);
+  - `RenderJSON` / `RenderText` / `RenderErrorJSON` enforce strict
+    JSON with full identifiers.
+
+### New CLI surface
+
+- `bjj plan --remote <R> --bookmark <B>`
+- `bjj plan --remote <R> --bookmark <B> --json`
+- `bjj help` now lists `plan`.
+
+### New ACTs
+
+- `docs/acts/ACT-BJJ-PLAN01.md` records the acceptance matrix,
+  static safeguards, and documented limitations.
+
+### Properties
+
+| Property                                                | Status |
+|---------------------------------------------------------|--------|
+| PLAN_SINGLE_VIEW_CONSISTENCY                            | PASS   |
+| PLAN_MID_RESOLVE_MUTATION_CANNOT_MIX_VIEWS              | PASS   |
+| PLAN_EFFECTIVE_OLD_QUERY_FAILS_CLOSED                   | PASS   |
+| JJ_BOOKMARK_OUTPUT_MALFORMED                            | FAIL_CLOSED |
+| JJ_COMMIT_OUTPUT_MALFORMED                              | FAIL_CLOSED |
+| PLAN_MALFORMED_JJ_OUTPUT                                | JJ_QUERY_FAILED |
+| DOC_SINGLE_VIEW_CONTRACT_MATCHES_CODE                   | PASS   |
+| CLI_COMMENT_MATCHES_OUTPUT                              | PASS   |
+| BJJ_PLAN_DETERMINISTIC                                  | PASS   |
+| BJJ_PLAN_JSON_STRICT                                    | PASS   |
+| BJJ_PLAN_NETWORK_ACCESS                                 | NO     |
+| BJJ_PLAN_REMOTE_MUTATION                                | NO     |
+| BJJ_PLAN_BOOKMARK_MUTATION                              | NO     |
+| PLAN_LAYER_HAS_NO_TRANSPORT                             | PASS   |
+| PLAN_CANONICAL_BODY_HAS_NO_REMOTE_URL                   | PASS   |
+| PLAN_SUBJECT_METADATA_BOUNDARY_EXPLICIT                 | PASS   |
+| PLAN_COMMIT_ORDER_CONTRACT_MATCHES_IMPLEMENTATION       | PASS   |
+| PLAN_REMOTE_BASELINE                                    | LOCAL_KNOWN_REMOTE_STATE |
+
+### Single-view consistency (post-CORRECTION01)
+
+PLAN01 captures the snapshot's operation id exactly once and
+threads it through every subsequent `CommitsAt` call. The
+production `JJSource` refuses an empty opID with the typed error
+`INCONSISTENT_REPOSITORY_VIEW`; re-pinning from inside a single
+resolve is no longer possible at the adapter boundary.
+
+The canonical `PublishPlan` body contains NO environment-specific
+or observation-specific fields. `source_operation_id` and
+`repository_path` live in a separate `PlanObservation` envelope
+returned by `plan.ResolveObserved`; they are diagnostic only and
+do not participate in canonical subject comparison.
+
+## Explicit non-goals (deferred from ACT-PLAN01)
+
+- `SubjectDigest` and evidence binding
+- `bjj check`, `bjj publish`, `bjj receipt`
+- Factory gates, admission policy, transport, remote verification
+- Multi-bookmark plans, automatic outgoing-bookmark discovery,
+  stack verification
+- `--all`, `--tracked`, `--changed`, `--stack`, `--remote-only`
+- Remote network contact or implicit `jj git fetch`
