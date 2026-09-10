@@ -1,0 +1,18 @@
+# Build artifacts
+/bjj
+/dist/
+/build/
+
+# Go test cache (when run inside the repo)
+/.gocache/
+/coverage.out
+/coverage.txt
+
+# Editor / OS junk
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local lab evidence dumps
+/bjj-evidence.json
